@@ -252,8 +252,14 @@ typedef struct BufferDesc
 
 	int			wait_backend_pgprocno;	/* backend of pin-count waiter */
 	int			freeNext;		/* link in freelist chain */
+
+	int			queuePrev;      /* SIEVE queue pointer */
+	int			queueNext;      /* SIEVE queue pointer */
+
 	LWLock		content_lock;	/* to lock access to buffer contents */
 } BufferDesc;
+
+#define POINTER_NOT_IN_QUEUE	(-1)	/* SIEVE queue pointer */
 
 /*
  * Concurrent access to buffer headers has proven to be more efficient if

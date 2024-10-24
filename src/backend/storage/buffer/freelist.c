@@ -39,6 +39,10 @@ typedef struct
 	 */
 	pg_atomic_uint32 nextVictimBuffer;
 
+	int			sieveHand;		/* SIEVE hand */
+	int			queueHead;		/* SIEVE queue head */
+	int			queueTail;		/* SIEVE queue tail */
+
 	int			firstFreeBuffer;	/* Head of list of unused buffers */
 	int			lastFreeBuffer; /* Tail of list of unused buffers */
 
@@ -159,6 +163,30 @@ ClockSweepTick(void)
 				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 			}
 		}
+	}
+	return victim;
+}
+
+static inline uint32
+SIEVE(void)
+{
+	uint32		victim;
+	BufferDesc *buf;
+	if(StrategyControl->sieveHand == POINTER_NOT_IN_QUEUE)
+	{
+		StrategyControl->sieveHand = StrategyControl->queueTail;
+		Assert(StrategyControl->sieveHand != POINTER_NOT_IN_QUEUE);
+	}
+
+	victim = StrategyControl->sieveHand;
+
+	buf = GetBufferDescriptor(StrategyControl->sieveHand);
+	StrategyControl->sieveHand = buf->queuePrev;
+
+	if(StrategyControl->sieveHand == POINTER_NOT_IN_QUEUE)
+	{
+		StrategyControl->sieveHand = StrategyControl->queueTail;
+		Assert(StrategyControl->sieveHand != POINTER_NOT_IN_QUEUE);
 	}
 	return victim;
 }
@@ -289,7 +317,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			 * Release the lock so someone else can access the freelist while
 			 * we check out this buffer.
 			 */
-			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+			// SpinLockRelease(&StrategyControl->buffer_strategy_lock);// SIEVE
 
 			/*
 			 * If the buffer is pinned or has a nonzero usage_count, we cannot
@@ -298,6 +326,17 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			 * it before we got to it.  It's probably impossible altogether as
 			 * of 8.3, but we'd better check anyway.)
 			 */
+			// local_buf_state = LockBufHdr(buf);
+			// if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
+			// 	&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
+			// {
+			// 	if (strategy != NULL)
+			// 		AddBufferToRing(strategy, buf);
+			// 	*buf_state = local_buf_state;
+			// 	return buf;
+			// }
+			// UnlockBufHdr(buf, local_buf_state);
+			// SIEVE
 			local_buf_state = LockBufHdr(buf);
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
@@ -305,9 +344,28 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
 				*buf_state = local_buf_state;
+				if(StrategyControl->queueHead == POINTER_NOT_IN_QUEUE)
+				{
+					buf->queuePrev = POINTER_NOT_IN_QUEUE;
+					buf->queueNext = POINTER_NOT_IN_QUEUE;
+					StrategyControl->queueHead = buf->buf_id;
+					StrategyControl->queueTail = buf->buf_id;
+				}
+				else 
+				{
+					BufferDesc *tempBuf;
+					tempBuf = GetBufferDescriptor(StrategyControl->queueHead);
+					tempBuf->queuePrev = buf->buf_id;
+					buf->queuePrev = POINTER_NOT_IN_QUEUE;
+					buf->queueNext = StrategyControl->queueHead;
+					StrategyControl->queueHead = buf->buf_id;
+				}
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 				return buf;
 			}
 			UnlockBufHdr(buf, local_buf_state);
+
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 		}
 	}
 
@@ -315,7 +373,11 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 	trycounter = NBuffers;
 	for (;;)
 	{
-		buf = GetBufferDescriptor(ClockSweepTick());
+		// SIEVE
+		// buf = GetBufferDescriptor(ClockSweepTick());
+
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+		buf = GetBufferDescriptor(SIEVE());
 
 		/*
 		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
@@ -327,16 +389,51 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		{
 			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
 			{
-				local_buf_state -= BUF_USAGECOUNT_ONE;
+				// local_buf_state -= BUF_USAGECOUNT_ONE;
+				local_buf_state -= BUF_USAGECOUNT_ONE * BUF_STATE_GET_USAGECOUNT(local_buf_state);
 
 				trycounter = NBuffers;
 			}
 			else
 			{
 				/* Found a usable buffer */
+				// if (strategy != NULL)
+				// 	AddBufferToRing(strategy, buf);
+				// *buf_state = local_buf_state;
+				// return buf;
+
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
 				*buf_state = local_buf_state;
+				BufferDesc *prevBuf;
+				BufferDesc *nextBuf;
+				if(buf->queuePrev != POINTER_NOT_IN_QUEUE && buf->queueNext != POINTER_NOT_IN_QUEUE)
+				{
+					prevBuf = GetBufferDescriptor(buf->queuePrev);
+					nextBuf = GetBufferDescriptor(buf->queueNext);
+					prevBuf->queueNext = buf->queueNext;
+					nextBuf->queuePrev = buf->queuePrev;
+				}
+				else if(buf->queuePrev != POINTER_NOT_IN_QUEUE)
+				{
+					prevBuf = GetBufferDescriptor(buf->queuePrev);
+					StrategyControl->queueTail = buf->queuePrev;
+					prevBuf->queueNext = POINTER_NOT_IN_QUEUE;
+				}
+				else if(buf->queueNext != POINTER_NOT_IN_QUEUE)
+				{
+					nextBuf = GetBufferDescriptor(buf->queueNext);
+					StrategyControl->queueHead = buf->queueNext;
+					nextBuf->queuePrev = POINTER_NOT_IN_QUEUE;
+				}
+				else
+				{
+					StrategyControl->queueHead = POINTER_NOT_IN_QUEUE;
+					StrategyControl->queueTail = POINTER_NOT_IN_QUEUE;
+					StrategyControl->sieveHand = POINTER_NOT_IN_QUEUE;
+				}
+				buf->queuePrev = POINTER_NOT_IN_QUEUE;
+				buf->queueNext = POINTER_NOT_IN_QUEUE;
 				return buf;
 			}
 		}
@@ -353,6 +450,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			elog(ERROR, "no unpinned buffers available");
 		}
 		UnlockBufHdr(buf, local_buf_state);
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 	}
 }
 
@@ -374,6 +472,37 @@ StrategyFreeBuffer(BufferDesc *buf)
 		if (buf->freeNext < 0)
 			StrategyControl->lastFreeBuffer = buf->buf_id;
 		StrategyControl->firstFreeBuffer = buf->buf_id;
+
+		// SIEVE
+		BufferDesc *prevBuf;
+		BufferDesc *nextBuf;
+		if(buf->queuePrev != POINTER_NOT_IN_QUEUE && buf->queueNext != POINTER_NOT_IN_QUEUE)
+		{
+			prevBuf = GetBufferDescriptor(buf->queuePrev);
+			nextBuf = GetBufferDescriptor(buf->queueNext);
+			prevBuf->queueNext = buf->queueNext;
+			nextBuf->queuePrev = buf->queuePrev;
+		}
+		else if(buf->queuePrev != POINTER_NOT_IN_QUEUE)
+		{
+			prevBuf = GetBufferDescriptor(buf->queuePrev);
+			StrategyControl->queueTail = buf->queuePrev;
+			prevBuf->queueNext = POINTER_NOT_IN_QUEUE;
+		}
+		else if(buf->queueNext != POINTER_NOT_IN_QUEUE)
+		{
+			nextBuf = GetBufferDescriptor(buf->queueNext);
+			StrategyControl->queueHead = buf->queueNext;
+			nextBuf->queuePrev = POINTER_NOT_IN_QUEUE;
+		}
+		else
+		{
+			StrategyControl->queueHead = POINTER_NOT_IN_QUEUE;
+			StrategyControl->queueTail = POINTER_NOT_IN_QUEUE;
+			StrategyControl->sieveHand = POINTER_NOT_IN_QUEUE;
+		}
+		buf->queuePrev = POINTER_NOT_IN_QUEUE;
+		buf->queueNext = POINTER_NOT_IN_QUEUE;
 	}
 
 	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
@@ -510,6 +639,11 @@ StrategyInitialize(bool init)
 		 */
 		StrategyControl->firstFreeBuffer = 0;
 		StrategyControl->lastFreeBuffer = NBuffers - 1;
+
+		/* SIEVE */
+		StrategyControl->sieveHand = POINTER_NOT_IN_QUEUE;
+		StrategyControl->queueHead = POINTER_NOT_IN_QUEUE;
+		StrategyControl->queueTail = POINTER_NOT_IN_QUEUE;
 
 		/* Initialize the clock sweep pointer */
 		pg_atomic_init_u32(&StrategyControl->nextVictimBuffer, 0);
