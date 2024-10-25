@@ -185,6 +185,7 @@ SIEVE(void)
 
 	if(StrategyControl->sieveHand == POINTER_NOT_IN_QUEUE)
 	{
+		StrategyControl->completePasses++;
 		StrategyControl->sieveHand = StrategyControl->queueTail;
 		Assert(StrategyControl->sieveHand != POINTER_NOT_IN_QUEUE);
 	}
@@ -371,11 +372,11 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 
 	/* Nothing on the freelist, so run the "clock sweep" algorithm */
 	trycounter = NBuffers;
+	
 	for (;;)
 	{
 		// SIEVE
 		// buf = GetBufferDescriptor(ClockSweepTick());
-
 		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
 		buf = GetBufferDescriptor(SIEVE());
 
@@ -432,8 +433,25 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 					StrategyControl->queueTail = POINTER_NOT_IN_QUEUE;
 					StrategyControl->sieveHand = POINTER_NOT_IN_QUEUE;
 				}
-				buf->queuePrev = POINTER_NOT_IN_QUEUE;
-				buf->queueNext = POINTER_NOT_IN_QUEUE;
+				
+				if(StrategyControl->queueHead == POINTER_NOT_IN_QUEUE)
+				{
+					buf->queuePrev = POINTER_NOT_IN_QUEUE;
+					buf->queueNext = POINTER_NOT_IN_QUEUE;
+					StrategyControl->queueHead = buf->buf_id;
+					StrategyControl->queueTail = buf->buf_id;
+				}
+				else 
+				{
+					BufferDesc *tempBuf;
+					tempBuf = GetBufferDescriptor(StrategyControl->queueHead);
+					tempBuf->queuePrev = buf->buf_id;
+					buf->queuePrev = POINTER_NOT_IN_QUEUE;
+					buf->queueNext = StrategyControl->queueHead;
+					StrategyControl->queueHead = buf->buf_id;
+				}
+
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 				return buf;
 			}
 		}
@@ -452,6 +470,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		UnlockBufHdr(buf, local_buf_state);
 		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 	}
+	
 }
 
 /*
