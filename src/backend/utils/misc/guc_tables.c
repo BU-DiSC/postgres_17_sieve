@@ -4722,6 +4722,18 @@ struct config_string ConfigureNamesString[] =
 		check_restrict_nonsystem_relation_kind, assign_restrict_nonsystem_relation_kind, NULL
 	},
 
+	//sieve
+	{
+		{"eviction_algorithm", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Sets the eviction algorithm for buffer pool."),
+			NULL,
+			GUC_IS_NAME
+		},
+		&eviction_algorithm,
+		"",
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, NULL, NULL, NULL, NULL

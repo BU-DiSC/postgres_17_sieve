@@ -23,12 +23,20 @@
 
 #define INT_ACCESS_ONCE(var)	((int)(*((volatile int *)&(var))))
 
+enum EvictionAlgorithm {
+    CLOCK_ALGORITHM = 0,
+    SIEVE_ALGORITHM = 1,
+    LRU_ALGORITHM = 2,
+    CFLRU_ALGORITHM = 3,
+    LRUWSR_ALGORITHM = 4
+};
 
 /*
  * The shared freelist control information.
  */
 typedef struct
 {
+	int eviction_algorithm;
 	/* Spinlock: protects the values below */
 	slock_t		buffer_strategy_lock;
 
@@ -209,6 +217,83 @@ have_free_buffer(void)
 		return false;
 }
 
+static void
+RemoveBufferFromQueue(BufferDesc *buf)
+{
+	BufferDesc *prevBuf;
+	BufferDesc *nextBuf;
+	if(buf->queuePrev != POINTER_NOT_IN_QUEUE && buf->queueNext != POINTER_NOT_IN_QUEUE)
+	{
+		prevBuf = GetBufferDescriptor(buf->queuePrev);
+		nextBuf = GetBufferDescriptor(buf->queueNext);
+		prevBuf->queueNext = buf->queueNext;
+		nextBuf->queuePrev = buf->queuePrev;
+	}
+	else if(buf->queuePrev != POINTER_NOT_IN_QUEUE)
+	{
+		prevBuf = GetBufferDescriptor(buf->queuePrev);
+		StrategyControl->queueTail = buf->queuePrev;
+		prevBuf->queueNext = POINTER_NOT_IN_QUEUE;
+	}
+	else if(buf->queueNext != POINTER_NOT_IN_QUEUE)
+	{
+		nextBuf = GetBufferDescriptor(buf->queueNext);
+		StrategyControl->queueHead = buf->queueNext;
+		nextBuf->queuePrev = POINTER_NOT_IN_QUEUE;
+	}
+	else
+	{
+		StrategyControl->queueHead = POINTER_NOT_IN_QUEUE;
+		StrategyControl->queueTail = POINTER_NOT_IN_QUEUE;
+		StrategyControl->sieveHand = POINTER_NOT_IN_QUEUE;
+	}
+
+	buf->queuePrev = POINTER_NOT_IN_QUEUE;
+	buf->queueNext = POINTER_NOT_IN_QUEUE;
+}
+
+static void
+AddBufferToQueue(BufferDesc *buf)
+{
+	if(StrategyControl->queueHead == POINTER_NOT_IN_QUEUE)
+	{
+		buf->queuePrev = POINTER_NOT_IN_QUEUE;
+		buf->queueNext = POINTER_NOT_IN_QUEUE;
+		StrategyControl->queueHead = buf->buf_id;
+		StrategyControl->queueTail = buf->buf_id;
+	}
+	else
+	{
+		BufferDesc *tempBuf;
+		tempBuf = GetBufferDescriptor(StrategyControl->queueHead);
+		tempBuf->queuePrev = buf->buf_id;
+		buf->queuePrev = POINTER_NOT_IN_QUEUE;
+		buf->queueNext = StrategyControl->queueHead;
+		StrategyControl->queueHead = buf->buf_id;
+	}
+}
+
+void 
+StrategyPromoteBuffer(BufferDesc *buf)
+{
+	if(StrategyControl->eviction_algorithm != LRU_ALGORITHM && StrategyControl->eviction_algorithm != CFLRU_ALGORITHM && StrategyControl->eviction_algorithm != LRUWSR_ALGORITHM)
+		return;
+	else
+	{
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+		if(buf->buf_id == StrategyControl->queueHead)
+		{
+			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+			return;
+		}
+		
+		RemoveBufferFromQueue(buf);
+		
+		AddBufferToQueue(buf);
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+	}
+}
+
 /*
  * StrategyGetBuffer
  *
@@ -318,8 +403,6 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			 * Release the lock so someone else can access the freelist while
 			 * we check out this buffer.
 			 */
-			// SpinLockRelease(&StrategyControl->buffer_strategy_lock);// SIEVE
-
 			/*
 			 * If the buffer is pinned or has a nonzero usage_count, we cannot
 			 * use it; discard it and retry.  (This can only happen if VACUUM
@@ -327,150 +410,258 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			 * it before we got to it.  It's probably impossible altogether as
 			 * of 8.3, but we'd better check anyway.)
 			 */
-			// local_buf_state = LockBufHdr(buf);
-			// if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-			// 	&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
-			// {
-			// 	if (strategy != NULL)
-			// 		AddBufferToRing(strategy, buf);
-			// 	*buf_state = local_buf_state;
-			// 	return buf;
-			// }
-			// UnlockBufHdr(buf, local_buf_state);
-			// SIEVE
-			local_buf_state = LockBufHdr(buf);
-			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
+			if(StrategyControl->eviction_algorithm == CLOCK_ALGORITHM)
 			{
-				if (strategy != NULL)
-					AddBufferToRing(strategy, buf);
-				*buf_state = local_buf_state;
-				if(StrategyControl->queueHead == POINTER_NOT_IN_QUEUE)
-				{
-					buf->queuePrev = POINTER_NOT_IN_QUEUE;
-					buf->queueNext = POINTER_NOT_IN_QUEUE;
-					StrategyControl->queueHead = buf->buf_id;
-					StrategyControl->queueTail = buf->buf_id;
-				}
-				else 
-				{
-					BufferDesc *tempBuf;
-					tempBuf = GetBufferDescriptor(StrategyControl->queueHead);
-					tempBuf->queuePrev = buf->buf_id;
-					buf->queuePrev = POINTER_NOT_IN_QUEUE;
-					buf->queueNext = StrategyControl->queueHead;
-					StrategyControl->queueHead = buf->buf_id;
-				}
 				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
-				return buf;
+				local_buf_state = LockBufHdr(buf);
+				if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
+					&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
+				{
+					if (strategy != NULL)
+						AddBufferToRing(strategy, buf);
+					*buf_state = local_buf_state;
+					return buf;
+				}
+				UnlockBufHdr(buf, local_buf_state);
 			}
-			UnlockBufHdr(buf, local_buf_state);
+			else if(StrategyControl->eviction_algorithm == SIEVE_ALGORITHM
+					|| StrategyControl->eviction_algorithm == LRU_ALGORITHM
+					|| StrategyControl->eviction_algorithm == CFLRU_ALGORITHM
+					|| StrategyControl->eviction_algorithm == LRUWSR_ALGORITHM)
+			{
+				local_buf_state = LockBufHdr(buf);
+				if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
+					&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0)
+				{
+					if (strategy != NULL)
+						AddBufferToRing(strategy, buf);
+					*buf_state = local_buf_state;
+					AddBufferToQueue(buf);
+					SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+					return buf;
+				}
+				UnlockBufHdr(buf, local_buf_state);
 
-			SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+			}
 		}
 	}
 
 	/* Nothing on the freelist, so run the "clock sweep" algorithm */
 	trycounter = NBuffers;
 	
-	for (;;)
+	if(StrategyControl->eviction_algorithm == CLOCK_ALGORITHM)
 	{
-		// SIEVE
-		// buf = GetBufferDescriptor(ClockSweepTick());
-		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
-		buf = GetBufferDescriptor(SIEVE());
-
-		/*
-		 * If the buffer is pinned or has a nonzero usage_count, we cannot use
-		 * it; decrement the usage_count (unless pinned) and keep scanning.
-		 */
-		local_buf_state = LockBufHdr(buf);
-
-		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+		for (;;)
 		{
-			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
-			{
-				// local_buf_state -= BUF_USAGECOUNT_ONE;
-				local_buf_state -= BUF_USAGECOUNT_ONE * BUF_STATE_GET_USAGECOUNT(local_buf_state);
+			buf = GetBufferDescriptor(ClockSweepTick());
 
-				trycounter = NBuffers;
-			}
-			else
-			{
-				/* Found a usable buffer */
-				// if (strategy != NULL)
-				// 	AddBufferToRing(strategy, buf);
-				// *buf_state = local_buf_state;
-				// return buf;
+			/*
+			* If the buffer is pinned or has a nonzero usage_count, we cannot use
+			* it; decrement the usage_count (unless pinned) and keep scanning.
+			*/
+			local_buf_state = LockBufHdr(buf);
 
-				if (strategy != NULL)
-					AddBufferToRing(strategy, buf);
-				*buf_state = local_buf_state;
-				BufferDesc *prevBuf;
-				BufferDesc *nextBuf;
-				if(buf->queuePrev != POINTER_NOT_IN_QUEUE && buf->queueNext != POINTER_NOT_IN_QUEUE)
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
 				{
-					prevBuf = GetBufferDescriptor(buf->queuePrev);
-					nextBuf = GetBufferDescriptor(buf->queueNext);
-					prevBuf->queueNext = buf->queueNext;
-					nextBuf->queuePrev = buf->queuePrev;
-				}
-				else if(buf->queuePrev != POINTER_NOT_IN_QUEUE)
-				{
-					prevBuf = GetBufferDescriptor(buf->queuePrev);
-					StrategyControl->queueTail = buf->queuePrev;
-					prevBuf->queueNext = POINTER_NOT_IN_QUEUE;
-				}
-				else if(buf->queueNext != POINTER_NOT_IN_QUEUE)
-				{
-					nextBuf = GetBufferDescriptor(buf->queueNext);
-					StrategyControl->queueHead = buf->queueNext;
-					nextBuf->queuePrev = POINTER_NOT_IN_QUEUE;
+					local_buf_state -= BUF_USAGECOUNT_ONE;
+
+					trycounter = NBuffers;
 				}
 				else
 				{
-					StrategyControl->queueHead = POINTER_NOT_IN_QUEUE;
-					StrategyControl->queueTail = POINTER_NOT_IN_QUEUE;
-					StrategyControl->sieveHand = POINTER_NOT_IN_QUEUE;
+					/* Found a usable buffer */
+					if (strategy != NULL)
+						AddBufferToRing(strategy, buf);
+					*buf_state = local_buf_state;
+					return buf;
 				}
-				
-				if(StrategyControl->queueHead == POINTER_NOT_IN_QUEUE)
-				{
-					buf->queuePrev = POINTER_NOT_IN_QUEUE;
-					buf->queueNext = POINTER_NOT_IN_QUEUE;
-					StrategyControl->queueHead = buf->buf_id;
-					StrategyControl->queueTail = buf->buf_id;
-				}
-				else 
-				{
-					BufferDesc *tempBuf;
-					tempBuf = GetBufferDescriptor(StrategyControl->queueHead);
-					tempBuf->queuePrev = buf->buf_id;
-					buf->queuePrev = POINTER_NOT_IN_QUEUE;
-					buf->queueNext = StrategyControl->queueHead;
-					StrategyControl->queueHead = buf->buf_id;
-				}
+			}
+			else if (--trycounter == 0)
+			{
+				/*
+				* We've scanned all the buffers without making any state changes,
+				* so all the buffers are pinned (or were when we looked at them).
+				* We could hope that someone will free one eventually, but it's
+				* probably better to fail than to risk getting stuck in an
+				* infinite loop.
+				*/
+				UnlockBufHdr(buf, local_buf_state);
+				elog(ERROR, "no unpinned buffers available");
+			}
+			UnlockBufHdr(buf, local_buf_state);
+		}
+	}
+	else if(StrategyControl->eviction_algorithm == SIEVE_ALGORITHM)
+	{
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+		for (;;)
+		{
+			buf = GetBufferDescriptor(SIEVE());
 
+			local_buf_state = LockBufHdr(buf);
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
+				{
+					local_buf_state -= BUF_USAGECOUNT_ONE * BUF_STATE_GET_USAGECOUNT(local_buf_state);
+					trycounter = NBuffers;
+				}
+				else
+				{
+					if (strategy != NULL)
+						AddBufferToRing(strategy, buf);
+					*buf_state = local_buf_state;
+					RemoveBufferFromQueue(buf);
+					AddBufferToQueue(buf);
+
+					SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+					return buf;
+				}
+			}
+			else if (--trycounter == 0)
+			{
+				UnlockBufHdr(buf, local_buf_state);
+				elog(ERROR, "no unpinned buffers available");
+			}
+			UnlockBufHdr(buf, local_buf_state);
+		}
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+	}
+	else if(StrategyControl->eviction_algorithm == LRU_ALGORITHM)
+	{
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+		buf = GetBufferDescriptor(StrategyControl->queueTail);
+		for (;;)
+		{
+			BufferDesc *tempBuf = buf;
+			local_buf_state = LockBufHdr(buf);
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				if (strategy != NULL)
+					AddBufferToRing(strategy, buf);
+				*buf_state = local_buf_state;
+				RemoveBufferFromQueue(buf);
+				AddBufferToQueue(buf);
 				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 				return buf;
 			}
+			else if (--trycounter == 0)
+			{
+				UnlockBufHdr(buf, local_buf_state);
+				elog(ERROR, "no unpinned buffers available");
+			}
+			
+			buf = GetBufferDescriptor(buf->queuePrev);
+			UnlockBufHdr(tempBuf, local_buf_state);
 		}
-		else if (--trycounter == 0)
-		{
-			/*
-			 * We've scanned all the buffers without making any state changes,
-			 * so all the buffers are pinned (or were when we looked at them).
-			 * We could hope that someone will free one eventually, but it's
-			 * probably better to fail than to risk getting stuck in an
-			 * infinite loop.
-			 */
-			UnlockBufHdr(buf, local_buf_state);
-			elog(ERROR, "no unpinned buffers available");
-		}
-		UnlockBufHdr(buf, local_buf_state);
 		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
 	}
-	
+	else if(StrategyControl->eviction_algorithm == CFLRU_ALGORITHM)
+	{
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+		buf = GetBufferDescriptor(StrategyControl->queueTail);
+		for (int i = 0; i < NBuffers / 3; i++)
+		{
+			BufferDesc *tempBuf = buf;
+			local_buf_state = LockBufHdr(buf);
+
+			if (local_buf_state & BM_DIRTY)
+			{
+				buf = GetBufferDescriptor(buf->queuePrev);
+				UnlockBufHdr(tempBuf, local_buf_state);
+				continue;
+			}
+			
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				if (strategy != NULL)
+					AddBufferToRing(strategy, buf);
+				*buf_state = local_buf_state;
+				RemoveBufferFromQueue(buf);
+				AddBufferToQueue(buf);
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+				return buf;
+			}
+			
+			buf = GetBufferDescriptor(buf->queuePrev);
+			UnlockBufHdr(tempBuf, local_buf_state);
+		}
+
+		buf = GetBufferDescriptor(StrategyControl->queueTail);
+		for (;;)
+		{
+			BufferDesc *tempBuf = buf;
+			local_buf_state = LockBufHdr(buf);
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				if (strategy != NULL)
+					AddBufferToRing(strategy, buf);
+				*buf_state = local_buf_state;
+				RemoveBufferFromQueue(buf);
+				AddBufferToQueue(buf);
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+				return buf;
+			}
+			else if (--trycounter == 0)
+			{
+				UnlockBufHdr(buf, local_buf_state);
+				elog(ERROR, "no unpinned buffers available");
+			}
+			
+			buf = GetBufferDescriptor(buf->queuePrev);
+			UnlockBufHdr(tempBuf, local_buf_state);
+		}
+		
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+	}
+	else if(StrategyControl->eviction_algorithm == LRUWSR_ALGORITHM)
+	{
+		SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
+		buf = GetBufferDescriptor(StrategyControl->queueTail);
+		for (;;)
+		{
+			BufferDesc *tempBuf = buf;
+			local_buf_state = LockBufHdr(buf);
+
+			if ((local_buf_state & BM_DIRTY) && (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0))
+			{
+				buf = GetBufferDescriptor(buf->queuePrev);
+				local_buf_state -= BUF_USAGECOUNT_ONE * BUF_STATE_GET_USAGECOUNT(local_buf_state);
+				UnlockBufHdr(tempBuf, local_buf_state);
+				RemoveBufferFromQueue(tempBuf);
+				AddBufferToQueue(tempBuf);
+				continue;
+			}
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				if (strategy != NULL)
+					AddBufferToRing(strategy, buf);
+				*buf_state = local_buf_state;
+				RemoveBufferFromQueue(buf);
+				AddBufferToQueue(buf);
+				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+				return buf;
+			}
+			else if (--trycounter == 0)
+			{
+				UnlockBufHdr(buf, local_buf_state);
+				elog(ERROR, "no unpinned buffers available");
+			}
+			
+			buf = GetBufferDescriptor(buf->queuePrev);
+			UnlockBufHdr(tempBuf, local_buf_state);
+		}
+		SpinLockRelease(&StrategyControl->buffer_strategy_lock);
+	}
+
+	return NULL;
 }
 
 /*
@@ -492,36 +683,10 @@ StrategyFreeBuffer(BufferDesc *buf)
 			StrategyControl->lastFreeBuffer = buf->buf_id;
 		StrategyControl->firstFreeBuffer = buf->buf_id;
 
-		// SIEVE
-		BufferDesc *prevBuf;
-		BufferDesc *nextBuf;
-		if(buf->queuePrev != POINTER_NOT_IN_QUEUE && buf->queueNext != POINTER_NOT_IN_QUEUE)
+		if(StrategyControl->eviction_algorithm != CLOCK_ALGORITHM)
 		{
-			prevBuf = GetBufferDescriptor(buf->queuePrev);
-			nextBuf = GetBufferDescriptor(buf->queueNext);
-			prevBuf->queueNext = buf->queueNext;
-			nextBuf->queuePrev = buf->queuePrev;
-		}
-		else if(buf->queuePrev != POINTER_NOT_IN_QUEUE)
-		{
-			prevBuf = GetBufferDescriptor(buf->queuePrev);
-			StrategyControl->queueTail = buf->queuePrev;
-			prevBuf->queueNext = POINTER_NOT_IN_QUEUE;
-		}
-		else if(buf->queueNext != POINTER_NOT_IN_QUEUE)
-		{
-			nextBuf = GetBufferDescriptor(buf->queueNext);
-			StrategyControl->queueHead = buf->queueNext;
-			nextBuf->queuePrev = POINTER_NOT_IN_QUEUE;
-		}
-		else
-		{
-			StrategyControl->queueHead = POINTER_NOT_IN_QUEUE;
-			StrategyControl->queueTail = POINTER_NOT_IN_QUEUE;
-			StrategyControl->sieveHand = POINTER_NOT_IN_QUEUE;
-		}
-		buf->queuePrev = POINTER_NOT_IN_QUEUE;
-		buf->queueNext = POINTER_NOT_IN_QUEUE;
+			RemoveBufferFromQueue(buf);
+		}		
 	}
 
 	SpinLockRelease(&StrategyControl->buffer_strategy_lock);
@@ -652,6 +817,26 @@ StrategyInitialize(bool init)
 
 		SpinLockInit(&StrategyControl->buffer_strategy_lock);
 
+		if(strcmp(eviction_algorithm, "sieve") == 0) 
+		{
+			StrategyControl->eviction_algorithm = SIEVE_ALGORITHM;
+		}
+		else if(strcmp(eviction_algorithm, "lru") == 0)
+		{
+			StrategyControl->eviction_algorithm = LRU_ALGORITHM;
+		}
+		else if(strcmp(eviction_algorithm, "cflru") == 0)
+		{
+			StrategyControl->eviction_algorithm = CFLRU_ALGORITHM;
+		}
+		else if(strcmp(eviction_algorithm, "lruwsr") == 0)
+		{
+			StrategyControl->eviction_algorithm = LRUWSR_ALGORITHM;
+		}
+		else
+		{
+			StrategyControl->eviction_algorithm = CLOCK_ALGORITHM;
+		}
 		/*
 		 * Grab the whole linked list of free buffers for our strategy. We
 		 * assume it was previously set up by InitBufferPool().

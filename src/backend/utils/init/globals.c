@@ -166,3 +166,7 @@ int			notify_buffers = 16;
 int			serializable_buffers = 32;
 int			subtransaction_buffers = 0;
 int			transaction_buffers = 0;
+
+//sieve
+
+char        *eviction_algorithm = NULL;

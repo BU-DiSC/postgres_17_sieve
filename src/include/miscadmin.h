@@ -186,6 +186,9 @@ extern PGDLLIMPORT int serializable_buffers;
 extern PGDLLIMPORT int subtransaction_buffers;
 extern PGDLLIMPORT int transaction_buffers;
 
+//sieve
+extern PGDLLIMPORT char *eviction_algorithm;
+
 extern PGDLLIMPORT int MyProcPid;
 extern PGDLLIMPORT pg_time_t MyStartTime;
 extern PGDLLIMPORT TimestampTz MyStartTimestamp;

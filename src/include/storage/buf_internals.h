@@ -429,6 +429,7 @@ extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
 extern IOContext IOContextForStrategy(BufferAccessStrategy strategy);
 extern BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy,
 									 uint32 *buf_state, bool *from_ring);
+extern void StrategyPromoteBuffer(BufferDesc *buf);									 
 extern void StrategyFreeBuffer(BufferDesc *buf);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy,
 								 BufferDesc *buf, bool from_ring);

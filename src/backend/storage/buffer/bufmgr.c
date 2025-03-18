@@ -2647,6 +2647,8 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 	Assert(!BufferIsLocal(b));
 	Assert(ReservedRefCountEntry != NULL);
 
+	StrategyPromoteBuffer(buf);
+
 	ref = GetPrivateRefCountEntry(b, true);
 
 	if (ref == NULL)
@@ -2761,6 +2763,7 @@ PinBuffer_Locked(BufferDesc *buf)
 	 */
 	Assert(GetPrivateRefCountEntry(BufferDescriptorGetBuffer(buf), false) == NULL);
 
+	// StrategyPromoteBuffer(buf);
 	/*
 	 * Buffer can't have a preexisting pin, so mark its page as defined to
 	 * Valgrind (this is similar to the PinBuffer() case where the backend
@@ -2778,7 +2781,7 @@ PinBuffer_Locked(BufferDesc *buf)
 	UnlockBufHdr(buf, buf_state);
 
 	b = BufferDescriptorGetBuffer(buf);
-
+	
 	ref = NewPrivateRefCountEntry(b);
 	ref->refcount++;
 
